@@ -1,0 +1,18 @@
+{
+  "title": "Telford Ward Sacrament Meeting {date}",
+  "description": "Cottonwood Creek 4th Ward Sacrament Meeting",
+  "category": "Non Profit/Activism",
+  "start_time": "09:00",
+  "timezone": "America/Denver",
+  "privacy": "unlisted",
+  "unlist_replay": true,
+  "disable_chat": true,
+  "made_for_kids": false,
+  "latency": "normal",
+  "enable_dvr": true,
+  "enable_auto_start": false,
+  "enable_auto_stop": true,
+  "stream_id": "bMIId10OkxazJJy6m8r3gQ1601410147554813",
+  "client_secrets_file": "client_secret.json",
+  "token_file": "token.json"
+}
