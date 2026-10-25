@@ -1,4 +1,8 @@
 .env
+sendlink-preferences.json
+makelink-preferences.json
+client_secret.json
+token.json
 __pycache__/
 *.pyc
 .DS_Store
