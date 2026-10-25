@@ -1,0 +1,9 @@
+{
+  "sheet_id": "your-google-sheet-id",
+  "sender_email": "moderator@telfordward.org",
+  "sender_name": "Cottonwood Creek 4th Ward Meetings",
+  "gmail_user": "moderator@telfordward.org",
+  "gmail_app_password": "your-16-char-app-password",
+  "client_secrets_file": "client_secret.json",
+  "token_file": "token.json"
+}
