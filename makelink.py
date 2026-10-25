@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 makelink.py - Automatically creates a YouTube Livestream broadcast and outputs
-the shareable watch link (https://youtube.com/live/<VIDEO_ID>).
+the shareable watch link (https://youtu.be/<VIDEO_ID>).
 
-Order of operation for parameters:
-  1. Read defaults from preferences file (makelink-preferences.json)
+Supports reusing settings and thumbnail image from a previous livestream, plus
+the 3-step order of operation for parameters:
+  1. Read defaults from preferences file (makelink-preferences.json) / reused broadcast
   2. Override with command-line arguments (if provided)
   3. Prompt interactively for any required parameter still missing
 """
@@ -15,17 +16,24 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import ssl
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube"
+YOUTUBE_UPLOAD_SCOPE = (
+    "https://www.googleapis.com/auth/youtube "
+    "https://www.googleapis.com/auth/spreadsheets.readonly "
+    "https://www.googleapis.com/auth/drive.readonly "
+    "openid https://www.googleapis.com/auth/userinfo.email"
+)
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+YOUTUBE_UPLOAD_BASE = "https://www.googleapis.com/upload/youtube/v3"
 DEFAULT_PREFS_FILE = "makelink-preferences.json"
 
 CATEGORY_MAP = {
@@ -57,6 +65,18 @@ def resolve_category_id(category_str: str) -> str:
     if s.isdigit():
         return s
     return CATEGORY_MAP.get(s.lower(), "29")
+
+
+def extract_video_id(val: str) -> str:
+    """Extract a YouTube video/broadcast ID from a URL or raw ID string."""
+    s = val.strip()
+    if not s or s.lower() == "latest":
+        return s.lower()
+    # Match youtube.com/live/<ID>, youtu.be/<ID>, or v=<ID>
+    m = re.search(r"(?:youtube\.com/live/|youtu\.be/|[?&]v=)([A-Za-z0-9_-]{11})", s)
+    if m:
+        return m.group(1)
+    return s
 
 
 def get_ssl_context() -> ssl.SSLContext:
@@ -160,7 +180,7 @@ def resolve_bool_param(
 
 def format_iso_start_time(start_time_str: str, tz_name: str) -> str:
     """
-    Convert a time string like '10:00', '2026-10-18 10:00', or full ISO-8601
+    Convert a time string like '09:00', '2026-10-18 09:00', or full ISO-8601
     into a timezone-aware ISO-8601 timestamp required by YouTube.
     """
     try:
@@ -365,16 +385,158 @@ def youtube_api_request(
         ) from exc
 
 
+def fetch_template_broadcast(
+    access_token: str, reuse_ref: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a previous YouTube broadcast to reuse its settings and thumbnail.
+    reuse_ref can be a broadcast ID, a YouTube URL, or 'latest'.
+    """
+    vid = extract_video_id(reuse_ref)
+    if not vid:
+        return None
+
+    if vid == "latest":
+        resp = youtube_api_request(
+            "GET",
+            "liveBroadcasts",
+            access_token,
+            {
+                "part": "id,snippet,status,contentDetails",
+                "mine": "true",
+                "maxResults": "10",
+            },
+        )
+        items = resp.get("items", [])
+        if not items:
+            return None
+        # Prefer the most recent broadcast that has a custom/maxres thumbnail, or the first one
+        for item in items:
+            if "maxres" in item.get("snippet", {}).get("thumbnails", {}):
+                return item
+        return items[0]
+
+    resp = youtube_api_request(
+        "GET",
+        "liveBroadcasts",
+        access_token,
+        {"part": "id,snippet,status,contentDetails", "id": vid},
+    )
+    items = resp.get("items", [])
+    return items[0] if items else None
+
+
+def get_best_thumbnail_url(broadcast_item: Dict[str, Any]) -> Optional[str]:
+    """Return the highest-resolution thumbnail URL from a broadcast item."""
+    thumbs = broadcast_item.get("snippet", {}).get("thumbnails", {})
+    for res in ("maxres", "standard", "high", "medium", "default"):
+        url = thumbs.get(res, {}).get("url")
+        if url:
+            return url
+    return None
+
+
+def load_thumbnail_bytes(
+    script_dir: pathlib.Path,
+    thumbnail_arg: Optional[str],
+    prefs: Dict[str, Any],
+    template_broadcast: Optional[Dict[str, Any]],
+) -> Tuple[Optional[bytes], str]:
+    """
+    Resolve thumbnail image bytes and source description.
+    Order:
+      1. --thumbnail CLI argument (local file path or URL)
+      2. 'thumbnail_file' in preferences (if file exists)
+      3. High-res thumbnail downloaded from reused broadcast on YouTube
+    """
+    ctx = get_ssl_context()
+    source_candidate = (
+        thumbnail_arg
+        if thumbnail_arg is not None
+        else str(prefs.get("thumbnail_file") or "").strip()
+    )
+
+    if source_candidate:
+        if source_candidate.startswith(("http://", "https://")):
+            req = urllib.request.Request(source_candidate)
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                return resp.read(), f"URL ({source_candidate})"
+        path = (
+            pathlib.Path(source_candidate)
+            if os.path.isabs(source_candidate)
+            else script_dir / source_candidate
+        )
+        if path.exists():
+            return path.read_bytes(), f"Local file ({path})"
+
+    if template_broadcast:
+        thumb_url = get_best_thumbnail_url(template_broadcast)
+        if thumb_url:
+            req = urllib.request.Request(thumb_url)
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                data = resp.read()
+            # Cache locally to thumbnail.jpg if thumbnail_file is configured
+            if source_candidate and not source_candidate.startswith("http"):
+                cache_path = (
+                    pathlib.Path(source_candidate)
+                    if os.path.isabs(source_candidate)
+                    else script_dir / source_candidate
+                )
+                try:
+                    cache_path.write_bytes(data)
+                except Exception:
+                    pass
+            return data, f"Reused broadcast {template_broadcast['id']} ({thumb_url})"
+
+    return None, "None"
+
+
+def upload_thumbnail(
+    access_token: str, video_id: str, image_bytes: bytes
+) -> None:
+    """Upload a custom thumbnail image to a YouTube broadcast/video via thumbnails.set."""
+    query = urllib.parse.urlencode(
+        {"videoId": video_id, "uploadType": "media"}
+    )
+    url = f"{YOUTUBE_UPLOAD_BASE}/thumbnails/set?{query}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "image/jpeg",
+        "Content-Length": str(len(image_bytes)),
+        "Accept": "application/json",
+    }
+    req = urllib.request.Request(
+        url, data=image_bytes, headers=headers, method="POST"
+    )
+    ctx = get_ssl_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"YouTube Thumbnail Upload HTTP {exc.code}: {err_body}"
+        ) from exc
+
+
 def main() -> int:
     script_dir = pathlib.Path(__file__).resolve().parent
 
     parser = argparse.ArgumentParser(
-        description="Create a YouTube Livestream and output its watch link."
+        description="Create a YouTube Livestream (reusing settings/thumbnail from a previous stream) and output its watch link."
     )
     parser.add_argument(
         "--prefs",
         default=str(script_dir / DEFAULT_PREFS_FILE),
         help="Path to preferences JSON file (default: makelink-preferences.json).",
+    )
+    parser.add_argument(
+        "--reuse-from",
+        help="Previous YouTube broadcast ID, URL, or 'latest' to reuse settings and thumbnail from. Overrides preference.",
+    )
+    parser.add_argument(
+        "--thumbnail",
+        help="Path or URL to custom thumbnail image to apply to the broadcast. Overrides preference.",
     )
     parser.add_argument(
         "--title",
@@ -390,7 +552,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--start-time",
-        help="Scheduled start time (e.g. '10:00', '2026-10-18 10:00', or 'now'). Overrides preference.",
+        help="Scheduled start time (e.g. '09:00', '2026-10-18 09:00', or 'now'). Overrides preference.",
     )
     parser.add_argument(
         "--timezone",
@@ -500,6 +662,11 @@ def main() -> int:
         help="List existing YouTube stream keys/IDs on your channel and exit.",
     )
     parser.add_argument(
+        "--list-broadcasts",
+        action="store_true",
+        help="List recent YouTube broadcasts on your channel and exit.",
+    )
+    parser.add_argument(
         "--dry-run",
         "-n",
         action="store_true",
@@ -541,29 +708,95 @@ def main() -> int:
             print(f"  - ID: {sid} | Title: {stitle} | Key: {sname}")
         return 0
 
+    if args.list_broadcasts:
+        token = get_access_token(client_secrets_path, token_path)
+        resp = youtube_api_request(
+            "GET",
+            "liveBroadcasts",
+            token,
+            {
+                "part": "id,snippet,status,contentDetails",
+                "mine": "true",
+                "maxResults": "10",
+            },
+        )
+        items = resp.get("items", [])
+        print(f"Found {len(items)} recent broadcast(s) on your channel:")
+        for item in items:
+            bid = item.get("id")
+            st = item.get("status", {}).get("lifeCycleStatus", "")
+            btitle = item.get("snippet", {}).get("title", "")
+            has_thumb = "maxres" in item.get("snippet", {}).get("thumbnails", {})
+            print(
+                f"  - ID: {bid} | Status: {st:<9} | Custom Thumb: {str(has_thumb):<5} | Title: {btitle}"
+            )
+        return 0
+
+    # Check if we are reusing a previous broadcast
+    reuse_ref = (
+        args.reuse_from
+        if args.reuse_from is not None
+        else str(prefs.get("reuse_broadcast_id") or "").strip()
+    )
+    template_broadcast: Optional[Dict[str, Any]] = None
+    access_token: Optional[str] = None
+
+    if reuse_ref:
+        try:
+            access_token = get_access_token(client_secrets_path, token_path)
+            template_broadcast = fetch_template_broadcast(access_token, reuse_ref)
+        except Exception as exc:
+            print(
+                f"Warning: Could not fetch template broadcast '{reuse_ref}': {exc}",
+                file=sys.stderr,
+            )
+
+    # Seed defaults from the reused broadcast (if present), then overlay makelink-preferences.json
+    effective_prefs: Dict[str, Any] = {}
+    if template_broadcast:
+        t_snippet = template_broadcast.get("snippet", {})
+        t_status = template_broadcast.get("status", {})
+        t_content = template_broadcast.get("contentDetails", {})
+        effective_prefs.update(
+            {
+                "description": t_snippet.get("description", ""),
+                "category": str(t_snippet.get("categoryId", "29")),
+                "privacy": t_status.get("privacyStatus", "unlisted"),
+                "made_for_kids": t_status.get(
+                    "selfDeclaredMadeForKids",
+                    t_status.get("madeForKids", False),
+                ),
+                "latency": t_content.get("latencyPreference", "normal"),
+                "enable_dvr": t_content.get("enableDvr", True),
+                "enable_auto_start": t_content.get("enableAutoStart", False),
+                "enable_auto_stop": t_content.get("enableAutoStop", True),
+                "stream_id": t_content.get("boundStreamId", ""),
+            }
+        )
+    effective_prefs.update(prefs)
+
     # Step 2 & 3: Override with CLI args; if still missing, prompt interactively
     today_mm_dd = datetime.date.today().strftime("%m/%d")
 
     raw_title = resolve_param(
         args.title,
-        prefs,
+        effective_prefs,
         "title",
         "Enter livestream title (use {date} for MM/DD)",
         default_if_empty=f"Sacrament Meeting {today_mm_dd}",
     )
     title = raw_title.replace("{date}", today_mm_dd)
 
-    # Description can be empty without prompting if present in prefs as ""
     if args.description is not None:
         description = args.description
-    elif "description" in prefs:
-        description = str(prefs.get("description") or "").replace(
+    elif "description" in effective_prefs:
+        description = str(effective_prefs.get("description") or "").replace(
             "{date}", today_mm_dd
         )
     else:
         description = resolve_param(
             None,
-            prefs,
+            effective_prefs,
             "description",
             "Enter livestream description (optional)",
             default_if_empty="",
@@ -571,7 +804,7 @@ def main() -> int:
 
     category = resolve_param(
         args.category,
-        prefs,
+        effective_prefs,
         "category",
         "Enter broadcast category",
         default_if_empty="Non Profit/Activism",
@@ -580,7 +813,7 @@ def main() -> int:
 
     timezone_name = resolve_param(
         args.timezone,
-        prefs,
+        effective_prefs,
         "timezone",
         "Enter timezone (e.g. America/Denver)",
         default_if_empty="America/Denver",
@@ -588,7 +821,7 @@ def main() -> int:
 
     raw_start_time = resolve_param(
         args.start_time,
-        prefs,
+        effective_prefs,
         "start_time",
         "Enter scheduled start time (HH:MM, YYYY-MM-DD HH:MM, or 'now')",
         default_if_empty="now",
@@ -597,7 +830,7 @@ def main() -> int:
 
     privacy = resolve_param(
         args.privacy,
-        prefs,
+        effective_prefs,
         "privacy",
         "Enter privacy status (public, unlisted, private)",
         default_if_empty="unlisted",
@@ -605,7 +838,7 @@ def main() -> int:
 
     unlist_replay = resolve_bool_param(
         args.unlist_replay,
-        prefs,
+        effective_prefs,
         "unlist_replay",
         "Unlist replay once the stream ends?",
         default_bool=True,
@@ -613,7 +846,7 @@ def main() -> int:
 
     disable_chat = resolve_bool_param(
         args.disable_chat,
-        prefs,
+        effective_prefs,
         "disable_chat",
         "Disable live chat?",
         default_bool=True,
@@ -621,7 +854,7 @@ def main() -> int:
 
     made_for_kids = resolve_bool_param(
         args.made_for_kids,
-        prefs,
+        effective_prefs,
         "made_for_kids",
         "Is this stream Made for Kids?",
         default_bool=False,
@@ -629,7 +862,7 @@ def main() -> int:
 
     latency = resolve_param(
         args.latency,
-        prefs,
+        effective_prefs,
         "latency",
         "Enter stream latency (normal, low, ultraLow)",
         default_if_empty="normal",
@@ -637,7 +870,7 @@ def main() -> int:
 
     enable_dvr = resolve_bool_param(
         args.enable_dvr,
-        prefs,
+        effective_prefs,
         "enable_dvr",
         "Enable DVR (rewind during live)?",
         default_bool=True,
@@ -645,15 +878,15 @@ def main() -> int:
 
     enable_auto_start = resolve_bool_param(
         args.enable_auto_start,
-        prefs,
+        effective_prefs,
         "enable_auto_start",
         "Enable auto-start when encoder connects?",
-        default_bool=True,
+        default_bool=False,
     )
 
     enable_auto_stop = resolve_bool_param(
         args.enable_auto_stop,
-        prefs,
+        effective_prefs,
         "enable_auto_stop",
         "Enable auto-stop when encoder disconnects?",
         default_bool=True,
@@ -662,8 +895,35 @@ def main() -> int:
     stream_id = (
         args.stream_id
         if args.stream_id is not None
-        else str(prefs.get("stream_id") or "").strip()
+        else str(effective_prefs.get("stream_id") or "").strip()
     )
+
+    # Preserve additional contentDetails from the template broadcast if available
+    content_details: Dict[str, Any] = {
+        "enableDvr": enable_dvr,
+        "enableAutoStart": enable_auto_start,
+        "enableAutoStop": enable_auto_stop,
+        "latencyPreference": latency,
+    }
+    if template_broadcast:
+        t_cd = template_broadcast.get("contentDetails", {})
+        for key in (
+            "enableEmbed",
+            "recordFromStart",
+            "enableClosedCaptions",
+            "closedCaptionsType",
+            "projection",
+            "enableContentEncryption",
+        ):
+            if key in t_cd:
+                content_details[key] = t_cd[key]
+        if "monitorStream" in t_cd and "enableMonitorStream" in t_cd["monitorStream"]:
+            content_details["monitorStream"] = {
+                "enableMonitorStream": t_cd["monitorStream"]["enableMonitorStream"],
+                "broadcastStreamDelayMs": t_cd["monitorStream"].get(
+                    "broadcastStreamDelayMs", 0
+                ),
+            }
 
     broadcast_body = {
         "snippet": {
@@ -675,19 +935,30 @@ def main() -> int:
             "privacyStatus": privacy,
             "selfDeclaredMadeForKids": made_for_kids,
         },
-        "contentDetails": {
-            "enableDvr": enable_dvr,
-            "enableAutoStart": enable_auto_start,
-            "enableAutoStop": enable_auto_stop,
-            "latencyPreference": latency,
-        },
+        "contentDetails": content_details,
     }
 
+    thumb_bytes, thumb_source = load_thumbnail_bytes(
+        script_dir, args.thumbnail, effective_prefs, template_broadcast
+    )
+
     if args.dry_run:
-        print("=" * 70)
+        print("=" * 72)
         print("DRY RUN MODE - YOUTUBE LIVESTREAM WILL NOT BE CREATED")
-        print("=" * 70)
-        print(f"Preferences File   : {prefs_path} ({'found' if prefs_path.exists() else 'not found'})")
+        print("=" * 72)
+        print(
+            f"Preferences File   : {prefs_path} ({'found' if prefs_path.exists() else 'not found'})"
+        )
+        if template_broadcast:
+            t_title = template_broadcast.get("snippet", {}).get("title", "")
+            print(
+                f"Reused Broadcast   : {template_broadcast['id']} ({t_title})"
+            )
+        else:
+            print(f"Reused Broadcast   : {reuse_ref or 'None'}")
+        print(
+            f"Thumbnail Image    : {thumb_source} ({len(thumb_bytes) if thumb_bytes else 0} bytes)"
+        )
         print(f"Title              : {title}")
         print(f"Description        : {description}")
         print(f"Category           : {category} (YouTube categoryId={category_id})")
@@ -700,15 +971,19 @@ def main() -> int:
         print(f"Enable DVR         : {enable_dvr}")
         print(f"Enable Auto-Start  : {enable_auto_start}")
         print(f"Enable Auto-Stop   : {enable_auto_stop}")
-        print(f"Bind Stream ID     : {stream_id or '(None / Default in YouTube Studio)'}")
-        print("-" * 70)
+        print(
+            f"Bind Stream ID     : {stream_id or '(None / Default in YouTube Studio)'}"
+        )
+        print("-" * 72)
         print("YouTube API Request Payload:")
         print(json.dumps(broadcast_body, indent=2))
-        print("=" * 70)
+        print("=" * 72)
         return 0
 
     try:
-        access_token = get_access_token(client_secrets_path, token_path)
+        if not access_token:
+            access_token = get_access_token(client_secrets_path, token_path)
+
         created = youtube_api_request(
             "POST",
             "liveBroadcasts",
@@ -718,7 +993,7 @@ def main() -> int:
         )
         broadcast_id = created["id"]
 
-        # Set the video Category (e.g. '29' for Non Profit/Activism) on the created video
+        # 1. Set the video Category (e.g. '29' for Non Profit/Activism) on the created video
         youtube_api_request(
             "PUT",
             "videos",
@@ -734,6 +1009,11 @@ def main() -> int:
             },
         )
 
+        # 2. Upload custom thumbnail image (from local file or reused broadcast)
+        if thumb_bytes:
+            upload_thumbnail(access_token, broadcast_id, thumb_bytes)
+
+        # 3. Bind to existing stream key
         if stream_id:
             youtube_api_request(
                 "POST",
@@ -746,7 +1026,7 @@ def main() -> int:
                 },
             )
 
-        watch_url = f"https://youtube.com/live/{broadcast_id}"
+        watch_url = f"https://youtu.be/{broadcast_id}"
         print(watch_url)
         return 0
     except Exception as exc:
